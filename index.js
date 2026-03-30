@@ -5,6 +5,8 @@
  * AVISO: Use por sua conta e risco. LinkedIn proíbe automação nos ToS.
  */
 
+import { execSync } from 'child_process';
+import { readFileSync, existsSync } from 'fs';
 import { chromium, firefox } from 'playwright';
 import { config } from './config.js';
 import {
@@ -46,6 +48,53 @@ process.on('SIGINT', () => {
 });
 const STEP_TIMEOUT = config.stepTimeoutLog ?? 45000;
 const STEP_TIMEOUT_LONG = config.stepTimeoutLong ?? 90000;
+
+/** Viewport padrão; popups OAuth (Google) vêm com janela minúscula — setViewportSize corrige no Windows */
+const VIEWPORT = { width: 1280, height: 800 };
+
+/** WSL: Node roda no Linux, mas a interface gráfica é do Windows — Chromium “do Linux” costuma dar janela invisível/zoada */
+function isWsl() {
+  if (process.platform !== 'linux') return false;
+  if (existsSync('/mnt/c/Windows')) return true;
+  try {
+    const v = readFileSync('/proc/version', 'utf8').toLowerCase();
+    return v.includes('microsoft') || v.includes('wsl');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * WSL2 → Chrome com --remote-debugging-port escuta no Windows (127.0.0.1).
+ * O IP do Windows para o Linux é o nameserver do resolv.conf — NÃO use primeiro o "default via" do ip route
+ * (ex.: 172.26.0.1), que muitas vezes não encaminha a porta 9222.
+ */
+function buildChromeDebugHostsToTry(configuredHost, wsl) {
+  if (configuredHost !== 'auto') {
+    return configuredHost === 'localhost' ? ['localhost'] : [configuredHost, 'localhost'];
+  }
+  if (process.platform !== 'linux') return ['localhost'];
+  const list = [];
+  const add = (h) => {
+    if (h && !list.includes(h)) list.push(h);
+  };
+  if (wsl) {
+    try {
+      const resolv = readFileSync('/etc/resolv.conf', 'utf8');
+      for (const m of resolv.matchAll(/^nameserver\s+(\S+)/gm)) add(m[1]);
+    } catch {}
+  }
+  add('127.0.0.1');
+  add('localhost');
+  if (wsl) {
+    try {
+      const out = execSync('ip route show default 2>/dev/null || true', { encoding: 'utf8', shell: true });
+      const m = out.match(/default\s+via\s+(\S+)/);
+      if (m) add(m[1]);
+    } catch {}
+  }
+  return list.length ? list : ['localhost'];
+}
 
 /**
  * Executa uma operação e, se demorar mais que o timeout, loga onde travou
@@ -143,21 +192,50 @@ async function tryClickGoogleLogin(page) {
 
 async function waitForManualLogin(page) {
   console.log('🔐 Indo para a tela de login do LinkedIn...');
-  await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  
-  const url = page.url();
-  if (!url.includes('/login') && !url.includes('/uas/') && !url.includes('/checkpoint/')) {
-    console.log('   ✅ Já logado.');
-    return;
+
+  // OAuth "Entrar com Google" abre outra janela; no Windows ela costuma ficar ATRÁS do Chrome do Playwright
+  const ctx = page.context();
+  const bringPopupToFront = async (popup) => {
+    if (popup === page) return;
+    try {
+      await popup.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => null);
+      // LinkedIn/Google abrem OAuth com width/height minúsculos → janela “carimbo”; isto redimensiona a janela real
+      await popup.setViewportSize(VIEWPORT).catch(() => null);
+      await popup.bringToFront();
+      console.log('   📑 Janela extra (Google / verificação) ampliada e trazida para frente.');
+    } catch {}
+  };
+  ctx.on('page', bringPopupToFront);
+
+  try {
+    await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    const url = page.url();
+    if (!url.includes('/login') && !url.includes('/uas/') && !url.includes('/checkpoint/')) {
+      console.log('   ✅ Já logado.');
+      return;
+    }
+
+    await shortDelay();
+    const clickedGoogle = await tryClickGoogleLogin(page);
+    if (clickedGoogle) {
+      await shortDelay();
+      // Popup pode demorar; tenta trazer qualquer janela nova que já exista
+      for (const p of ctx.pages()) {
+        if (p !== page) await bringPopupToFront(p);
+      }
+    }
+
+    console.log('');
+    console.log('   👤 Faça o login manualmente no navegador (e na janela do Google, se abrir).');
+    console.log('   ⏳ Quando terminar, o script continuará automaticamente...');
+    console.log('');
+
+    await page.waitForURL(/linkedin\.com\/(feed|jobs|mynetwork|in\/)/, { timeout: 300000 }); // 5 min
+    console.log('   ✅ Login detectado!');
+  } finally {
+    ctx.off('page', bringPopupToFront);
   }
-  
-  console.log('');
-  console.log('   👤 Faça o login manualmente no navegador.');
-  console.log('   ⏳ Quando terminar, o script continuará automaticamente...');
-  console.log('');
-  
-  await page.waitForURL(/linkedin\.com\/(feed|jobs|mynetwork|in\/)/, { timeout: 300000 }); // 5 min
-  console.log('   ✅ Login detectado!');
 }
 
 function hasPoliticsContent(text) {
@@ -334,14 +412,20 @@ async function getJobDescription(page) {
   }
 }
 
-/** Verifica se a vaga é backend e exige Node/Nest/TS/JS */
+/** Verifica se a vaga é backend + Node/Nest/TS/JS e, se configurado, nível sênior */
 function jobMatchesKeywords(description, _legacy) {
   const desc = (description || '').toLowerCase();
   const backendKw = config.backendKeywords || ['backend', 'back-end', 'back end'];
   const techKw = config.techKeywords || ['node', 'nest', 'typescript', 'javascript'];
   const hasBackend = backendKw.some(kw => desc.includes(kw.toLowerCase()));
   const hasTech = techKw.some(kw => desc.includes(kw.toLowerCase()));
-  return hasTech && hasBackend;
+  if (!hasTech || !hasBackend) return false;
+  if (config.seniorOnly) {
+    const seniorKw = config.seniorKeywords || ['senior', 'sênior', 'sr.', 'staff'];
+    const ok = seniorKw.some(kw => desc.includes(String(kw).toLowerCase()));
+    if (!ok) return false;
+  }
+  return true;
 }
 
 async function fillFormFields(page, jobTitle) {
@@ -664,7 +748,26 @@ async function run() {
   console.log(`   Máximo de candidaturas: ${config.maxApplications}`);
   console.log(`   Velocidade: ${config.speed || 'fast'}`);
   console.log(`   Log de travamento: apenas durante candidatura (timeout ${STEP_TIMEOUT / 1000}s)`);
+  if (config.headless) {
+    console.log('👻 headless: true — o navegador roda sem janela. Para ver o Chrome: headless: false no config.js');
+  } else {
+    console.log('🪟 headless: false — o navegador deve abrir visível. Se não aparecer: Alt+Tab ou ícone na barra de tarefas.');
+  }
   console.log('');
+
+  const wsl = isWsl();
+  if (wsl && !config.headless && !config.useExistingChrome && config.browser !== 'firefox') {
+    console.error('');
+    console.error('❌ No WSL, com janela visível, não dá para usar o navegador instalado no Linux.');
+    console.error('   (É o Chrome com ícone de pinguim na barra — não é o Chrome do Windows.)');
+    console.error('');
+    console.error('   Coloque no config.js: useExistingChrome: true');
+    console.error('   Depois: PowerShell Admin → portproxy na porta 9222 (README.md)');
+    console.error('   Feche todos os Chromes → no WSL: npm run chrome → npm start');
+    console.error('   Ou rode npm start no PowerShell do Windows com useExistingChrome: false.');
+    console.error('');
+    process.exit(1);
+  }
 
   // Firefox tem menos dependências no Linux/WSL - use se Chromium falhar
   const useFirefox = config.browser === 'firefox';
@@ -676,25 +779,8 @@ async function run() {
 
   if (useExistingChrome) {
     const port = config.chromeDebugPort ?? 9222;
-    let host = config.chromeDebugHost ?? 'localhost';
-    if (host === 'auto' && process.platform === 'linux') {
-      try {
-        const { execSync } = await import('child_process');
-        const out = execSync('ip route show default 2>/dev/null || ip route', { encoding: 'utf8', shell: true });
-        const m = out.match(/default\s+via\s+(\S+)/);
-        const gw = m ? m[1] : '';
-        if (gw) host = gw;
-      } catch {
-        try {
-          const fs = await import('fs');
-          const resolv = fs.readFileSync('/etc/resolv.conf', 'utf8');
-          const m = resolv.match(/nameserver\s+(\S+)/);
-          if (m) host = m[1];
-        } catch {}
-      }
-    }
-    if (host === 'auto') host = 'localhost';
-    const hostsToTry = host === 'localhost' ? ['localhost'] : [host, 'localhost'];
+    const configuredHost = config.chromeDebugHost ?? 'localhost';
+    const hostsToTry = buildChromeDebugHostsToTry(configuredHost, wsl);
     let lastError;
     for (const h of hostsToTry) {
       const cdpUrl = `http://${h}:${port}`;
@@ -714,27 +800,54 @@ async function run() {
       const h = hostsToTry[0];
       console.error(`   ❌ Não foi possível conectar ao Chrome em ${h}:${port}.`);
       console.error('');
+      if (process.platform === 'win32') {
+        console.error('   No Windows você escolhe:');
+        console.error('');
+        console.error('   A) Mais simples: no config.js use useExistingChrome: false — o script abre o Chrome sozinho.');
+        console.error('');
+        console.error('   B) Manter useExistingChrome: true: feche o Chrome, rode .\\chrome-debug.cmd, depois start.cmd.');
+        console.error('');
+      }
       if (process.platform === 'linux') {
-        console.error('   Rodando do WSL? Opções:');
+        console.error('   Rodando do WSL? Checklist:');
         console.error('');
-        console.error('   A) useExistingChrome: false no config.js — abre novo Chrome (sem sua sessão)');
-        console.error('');
-        console.error('   B) Redirecionamento de porta no Windows (PowerShell Admin):');
+        console.error('   1) No Windows: feche o Chrome e abra com --remote-debugging-port=' + port + ' (npm run chrome ou chrome-debug.cmd)');
+        console.error('   2) Diagnóstico automático (no WSL, nesta pasta): npm run chrome:ping');
+        console.error('   3) Manual: cat /etc/resolv.conf → curl -s http://IP_DO_NAMESERVER:' + port + '/json/version');
+        console.error('   4) Se falhar: PowerShell Admin — portproxy + firewall (README):');
         console.error('      netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=' + port + ' connectaddress=127.0.0.1 connectport=' + port);
         console.error('      New-NetFirewallRule -DisplayName "Chrome DevTools" -Direction Inbound -Protocol TCP -LocalPort ' + port + ' -Action Allow');
         console.error('');
       }
-      console.error('   Depois abra o Chrome no Windows com:');
-      console.error('   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=' + port);
+      console.error('   Linha de comando do Chrome (se abrir manualmente):');
+      console.error('   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=' + port + ' --remote-allow-origins=*');
       process.exit(1);
     }
   } else {
+    // NUNCA usar viewport: null + --start-maximized no Windows com Playwright: o contexto fica sem
+    // windowId interno e a janela pode não aparecer ou ficar “invisível” no monitor.
+    const chromeArgs = [
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--lang=en-US',
+      // Posição na área visível do monitor principal (evita janela “perdida” em monitor desligado)
+      `--window-size=${VIEWPORT.width + 24},${VIEWPORT.height + 100}`,
+      '--window-position=120,80',
+    ];
+    if (wsl && !config.headless) {
+      chromeArgs.push('--disable-dev-shm-usage');
+      chromeArgs.push('--disable-gpu');
+    }
     const launchOptions = {
       headless: config.headless,
       slowMo: config.speed === 'fast' ? 0 : config.speed === 'slow' ? 80 : 25,
-      args: useFirefox ? [] : ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox', '--lang=en-US'],
+      args: useFirefox
+        ? ['-width', String(VIEWPORT.width + 24), '-height', String(VIEWPORT.height + 100)]
+        : chromeArgs,
     };
-    if (!useFirefox) launchOptions.channel = 'chrome';
+    // No WSL (Linux no Windows) o channel "chrome" é o binário Linux, não o seu Chrome — costuma ser instável; prefira useExistingChrome
+    if (!useFirefox && !(process.platform === 'linux' && wsl)) launchOptions.channel = 'chrome';
     try {
       browser = await browserType.launch(launchOptions);
     } catch {
@@ -744,7 +857,7 @@ async function run() {
       } else throw new Error('Falha ao iniciar Firefox');
     }
     context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
+      viewport: VIEWPORT,
       userAgent: useFirefox
         ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
         : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -764,6 +877,11 @@ async function run() {
   });
 
   const page = await context.newPage();
+  if (!config.headless) {
+    try {
+      await page.bringToFront();
+    } catch {}
+  }
   const loopMode = config.loopMode ?? false;
   const processedIds = new Set(); // Persiste entre ciclos para não candidatar 2x
 
@@ -800,7 +918,8 @@ async function run() {
     let noNewCardsCount = 0;
     let dailyLimitReached = false;
 
-    console.log(`📌 Processando vagas (backend + Node/Nest/TS/JS)${hasLimit ? ` — máx ${maxToApply}` : ' — sem limite'}`);
+    const filtros = (config.seniorOnly ? 'senior + ' : '') + 'backend + Node/Nest/TS/JS';
+    console.log(`📌 Processando vagas (${filtros})${hasLimit ? ` — máx ${maxToApply}` : ' — sem limite'}`);
     console.log('');
 
     while (!stopRequested && !dailyLimitReached && (hasLimit ? applicationsCount < maxToApply : true)) {
@@ -838,7 +957,8 @@ async function run() {
 
         const description = await getJobDescription(page);
         if (!jobMatchesKeywords(description)) {
-          console.log(`   ⏭️ Vaga ignorada (precisa ser backend + Node/Nest/TS/JS)`);
+          const req = (config.seniorOnly ? 'senior + ' : '') + 'backend + Node/Nest/TS/JS';
+          console.log(`   ⏭️ Vaga ignorada (precisa ser ${req})`);
           continue;
         }
 

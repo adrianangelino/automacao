@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node index.js",
     "apply": "node index.js",
-    "chrome": "node chrome-debug.js"
+    "start:win": "cmd /c start.cmd",
+    "chrome": "node chrome-debug.js",
+    "chrome:ping": "node check-chrome-cdp.mjs"
   },
   "keywords": ["linkedin", "automation", "jobs"],
   "author": "",

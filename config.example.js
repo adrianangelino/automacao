@@ -9,12 +9,16 @@ export const config = {
   password: 'sua-senha',
   loginWithGoogle: true,  // Preferir Google em vez de Apple (login/verificação)
   
-  // Termos de busca para as vagas
-  searchKeywords: 'desenvolvedor backend senior',
+  // Busca no LinkedIn (inclua "senior" na string se quiser vagas mais alinhadas)
+  searchKeywords: 'desenvolvedor backend senior OR node senior',
 
-  // Filtro: vaga DEVE ser backend e exigir Node/Nest/TS/JS
+  // Filtro: backend + Node/Nest/TS/JS
   backendKeywords: ['backend', 'back-end', 'back end'],
   techKeywords: ['node', 'node.js', 'nest', 'nest.js', 'typescript', 'javascript'],
+
+  // true = ignora vaga que não cite sênior (título/descrição)
+  seniorOnly: false,
+  seniorKeywords: ['senior', 'sênior', 'sr.', 'staff', 'principal engineer', 'lead developer', 'tech lead'],
   
   // Localização: apenas vagas do Brasil (fixo)
   // Geolocalização do navegador (São Paulo - evita alertas de segurança)
@@ -42,11 +46,10 @@ export const config = {
   // Navegador: 'chromium' (padrão) ou 'firefox' (menos deps no Linux/WSL)
   browser: 'chromium',
 
-  // Usar SEU Chrome já aberto (mais rápido, usa sua sessão/cookies)
-  // Abra o Chrome com: chrome --remote-debugging-port=9222
+  // Windows nativo: false ok. WSL com janela: true obrigatório (senão abre o Chrome do Linux, ícone com pinguim).
   useExistingChrome: false,
   chromeDebugPort: 9222,
-  chromeDebugHost: 'auto', // 'auto' = detecta IP do Windows quando rodando do WSL
+  chromeDebugHost: 'auto', // WSL: 'auto' = IP do Windows (nameserver do resolv.conf); Windows nativo: 'localhost'
   
   // Valores padrão para formulários Easy Apply
   experienceYears: 5,
