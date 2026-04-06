@@ -3,3 +3,4 @@ config.js
 .env
 *.log
 debug-connect.png
+.linkedin-easy-apply-daily.json

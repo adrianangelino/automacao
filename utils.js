@@ -7,6 +7,7 @@ let speedMultiplier = 0.3; // fast por padrão
 export function setSpeed(speed) {
   if (speed === 'fast') speedMultiplier = 0.25;
   else if (speed === 'slow') speedMultiplier = 1.2;
+  else if (speed === 'human') speedMultiplier = 1.35;
   else speedMultiplier = 0.5; // normal
 }
 
