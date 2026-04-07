@@ -42,6 +42,8 @@ const SELECTORS = {
 
 let applicationsCount = 0;
 let stopRequested = false;
+/** Índice na lista searchKeywordsList (rotação após cada lote de candidaturas). */
+let searchKeywordsRotationIndex = 0;
 process.on('SIGINT', () => {
   console.log('\n\n⏹️  Parando... (aguarde encerrar o ciclo atual)');
   stopRequested = true;
@@ -110,9 +112,10 @@ async function runStep(stepId, fn, customTimeout) {
   return Promise.race([fn(), timeout]);
 }
 
-/** Rola o modal até o final para revelar botões Avançar/Enviar */
+/** Rola o modal Easy Apply com mais passadas (formulários longos). */
 async function scrollModalToBottom(page) {
-  for (let i = 0; i < 3; i++) {
+  const passes = config.easyApplyModalScrollPasses ?? 6;
+  for (let i = 0; i < passes; i++) {
     await page.evaluate(() => {
       const selectors = [
         '[data-test-modal-id="easy-apply-modal"]',
@@ -135,7 +138,7 @@ async function scrollModalToBottom(page) {
     const box = await modal.boundingBox().catch(() => null);
     if (box) {
       await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < 8; i++) {
         await page.mouse.wheel(0, 400);
         await shortDelay();
       }
@@ -160,6 +163,64 @@ async function isDailyLimitReached(page) {
   } catch {
     return false;
   }
+}
+
+/** Preenche e-mail e senha na página de login do LinkedIn (fluxo em uma ou duas etapas). */
+async function tryEmailPasswordLogin(page) {
+  if (config.loginWithEmailPassword === false) return false;
+  if (!config.email || !config.password) return false;
+
+  const emailSel = '#username, input[name="session_key"], input[autocomplete="username"]';
+  const passSel =
+    '#password, input[name="session_password"], input[autocomplete="current-password"], input[type="password"]';
+
+  try {
+    await page.locator(emailSel).first().waitFor({ state: 'visible', timeout: 15000 });
+    const emailInput = page.locator(emailSel).first();
+    if (await emailInput.isEditable().catch(() => true)) {
+      await emailInput.click({ timeout: 3000 }).catch(() => null);
+      await emailInput.fill('');
+      await emailInput.fill(config.email);
+    }
+    await shortDelay();
+
+    let passLoc = page.locator(passSel).first();
+    const passVisible = await passLoc.isVisible().catch(() => false);
+    if (!passVisible) {
+      const submitEmail = page
+        .locator('button[type="submit"], input[type="submit"], button:has-text("Continuar"), button:has-text("Continue")')
+        .first();
+      if ((await submitEmail.count()) > 0) {
+        await submitEmail.click({ timeout: 6000 }).catch(() => null);
+        await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => null);
+        await randomDelay(1200, 2200);
+      }
+      passLoc = page.locator(passSel).first();
+    }
+
+    await passLoc.waitFor({ state: 'visible', timeout: 12000 });
+    await passLoc.click({ timeout: 3000 }).catch(() => null);
+    await passLoc.fill(config.password);
+    await shortDelay();
+
+    const signIn = page
+      .locator('button[type="submit"], button:has-text("Entrar"), button:has-text("Sign in"), input[type="submit"]')
+      .first();
+    await signIn.click({ timeout: 10000 });
+    await page.waitForLoadState('domcontentloaded', { timeout: 25000 }).catch(() => null);
+    await randomDelay(2000, 4000);
+    console.log('   🔑 E-mail e senha enviados (login automático).');
+    return true;
+  } catch (e) {
+    console.log('   ⚠️ Login automático e-mail/senha:', e?.message || e);
+    return false;
+  }
+}
+
+function isLinkedInLoggedInUrl(url) {
+  if (!url || !url.includes('linkedin.com')) return false;
+  if (url.includes('/login') || url.includes('/checkpoint') || url.includes('/uas/')) return false;
+  return /linkedin\.com\/(feed|jobs|mynetwork)/.test(url) || /linkedin\.com\/in\//.test(url);
 }
 
 /** Tenta clicar em "Continue with Google" / "Entrar com Google" (evita Apple) */
@@ -217,22 +278,50 @@ async function waitForManualLogin(page) {
     }
 
     await shortDelay();
+
+    if (config.loginWithEmailPassword !== false && config.email && config.password) {
+      await tryEmailPasswordLogin(page);
+      await randomDelay(1500, 3000);
+      if (isLinkedInLoggedInUrl(page.url())) {
+        console.log('   ✅ Sessão iniciada com e-mail e senha do config.');
+        return;
+      }
+    }
+
     const clickedGoogle = await tryClickGoogleLogin(page);
     if (clickedGoogle) {
       await shortDelay();
-      // Popup pode demorar; tenta trazer qualquer janela nova que já exista
       for (const p of ctx.pages()) {
         if (p !== page) await bringPopupToFront(p);
       }
     }
 
     console.log('');
-    console.log('   👤 Faça o login manualmente no navegador (e na janela do Google, se abrir).');
-    console.log('   ⏳ Quando terminar, o script continuará automaticamente...');
+    console.log(
+      '   👤 Se ainda aparecer verificação em duas etapas, CAPTCHA ou Google, conclua manualmente no navegador.'
+    );
+    console.log('   ⏳ Quando estiver logado, o script continuará automaticamente...');
     console.log('');
 
-    await page.waitForURL(/linkedin\.com\/(feed|jobs|mynetwork|in\/)/, { timeout: 300000 }); // 5 min
-    console.log('   ✅ Login detectado!');
+    const loginWaitMs = config.loginWaitTimeoutMs ?? 300_000;
+    const deadline = Date.now() + loginWaitMs;
+    const loggedRe = /linkedin\.com\/(feed|jobs|mynetwork|in\/)/;
+    while (Date.now() < deadline && !stopRequested) {
+      try {
+        if (page.isClosed()) break;
+        const u = page.url();
+        if (loggedRe.test(u) && !u.includes('/login')) {
+          console.log('   ✅ Login detectado!');
+          return;
+        }
+      } catch {
+        /* navegação / frame em transição */
+      }
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+    if (!stopRequested) {
+      throw new Error('Tempo esgotado aguardando login (5 min). Verifique e-mail, senha ou 2FA.');
+    }
   } finally {
     ctx.off('page', bringPopupToFront);
   }
@@ -411,25 +500,117 @@ async function runCoolDownWithBrowsing(page, totalMs) {
   }
 }
 
-/** Busca recrutadores e envia conexões */
-async function connectWithRecruiters(page) {
-  const maxConn = config.maxConnectionsToRecruiters ?? 10;
-  const terms = config.recruiterSearchTerms ?? ['tech recruiter', 'recrutador tech'];
-  if (maxConn <= 0) return;
-  console.log('');
-  console.log('🔍 Buscando recrutadores tech...');
+const SEND_INVITE_MODAL_SEL =
+  'button:has-text("Enviar sem nota"), button:has-text("Send without a note"), button:has-text("Send without note"), button:has-text("Enviar convite"), button:has-text("Send invitation"), button:has-text("Enviar"), button:has-text("Send"), button[aria-label*="Enviar"], button[aria-label*="Send invitation"]';
+
+/** Cancela qualquer download (currículo, PDF da vaga, etc.) — candidatura só com CV do perfil. */
+function attachBlockAllDownloads(context) {
+  const onDownload = (download) => {
+    download.cancel().catch(() => {});
+  };
+  const hookPage = (p) => {
+    try {
+      p.on('download', onDownload);
+    } catch {}
+  };
+  try {
+    context.on('page', hookPage);
+  } catch {}
+  for (const p of context.pages()) hookPage(p);
+}
+
+/**
+ * Clica em Conectar dentro de um card da busca de pessoas (várias UIs do LinkedIn).
+ */
+async function tryClickConnectInSearchResult(item, page) {
+  const skipIf = item.locator(
+    'button:has-text("Pendente"), button:has-text("Pending"), button:has-text("Mensagem"), button:has-text("Message"), button:has-text("Seguir"), button:has-text("Follow")'
+  );
+  if ((await skipIf.count().catch(() => 0)) > 0) {
+    const vis = await skipIf.first().isVisible().catch(() => false);
+    if (vis) return false;
+  }
+  if ((await item.locator('span:has-text("1º grau"), span:has-text("1st"), span:has-text("2º grau"), span:has-text("2nd")').count()) > 0) {
+    return false;
+  }
+
+  let btn = item.locator('button:has(span.artdeco-button__text:has-text("Conectar"))').first();
+  if ((await btn.count()) === 0) {
+    btn = item.locator('button:has(span.artdeco-button__text:has-text("Connect"))').first();
+  }
+  if ((await btn.count()) === 0) {
+    btn = item
+      .locator(
+        'button:has-text("Conectar"), button:has-text("Connect"), button[aria-label*="Conectar"], button[aria-label*="Connect"], button[aria-label*="Convidar"], button[aria-label*="Invite to connect"], a[aria-label*="Conectar"]'
+      )
+      .first();
+  }
+  if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+    await btn.click({ timeout: 8000 }).catch(() => null);
+    await randomDelay(900, 1800);
+    return true;
+  }
+
+  const more = item
+    .locator(
+      'button[aria-label*="More actions"], button[aria-label*="Mais ações"], button[aria-label*="Expand"], button[aria-label*="Exibir mais ações"]'
+    )
+    .first();
+  if ((await more.count()) > 0 && (await more.isVisible().catch(() => false))) {
+    await more.click({ timeout: 5000 }).catch(() => null);
+    await randomDelay(500, 1000);
+    const menuBtn = page
+      .locator(
+        '[role="menu"] button, [role="menuitem"], .artdeco-dropdown__content-inner button, div[role="presentation"] button'
+      )
+      .filter({ hasText: /^(Conectar|Connect|Convidar)$/i })
+      .first();
+    if ((await menuBtn.count()) > 0) {
+      await menuBtn.click({ timeout: 5000 }).catch(() => null);
+      await randomDelay(800, 1500);
+      return true;
+    }
+    await page.keyboard.press('Escape').catch(() => null);
+  }
+  return false;
+}
+
+/**
+ * @param {{ maxConn?: number, quiet?: boolean, deadline?: number }} [opts]
+ * @returns {Promise<number>} quantas conexões foram enviadas nesta chamada
+ */
+async function connectWithRecruiters(page, opts = {}) {
+  const maxConn = opts.maxConn ?? config.maxConnectionsToRecruiters ?? 10;
+  const quiet = opts.quiet ?? false;
+  const deadline = opts.deadline ?? null;
+  const terms = getRecruiterPeopleSearchQueries();
+  const cardMatchTokens =
+    config.recruiterMatchCardToJobKeywords === true ? tokenizeJobKeywordsForRecruiterMatch(getCurrentSearchKeywords()) : [];
+  if (maxConn <= 0) return 0;
+  if (deadline != null && Date.now() >= deadline) return 0;
+
+  if (!quiet) {
+    console.log('');
+    console.log('🔍 Buscando recrutadores (vagas: termo atual + filtro “contratando agora” quando existir)...');
+    if (config.recruiterSearchAlignWithJobKeywords !== false && getCurrentSearchKeywords().trim()) {
+      console.log(`   📌 Alinhado ao termo de vagas: "${getCurrentSearchKeywords().slice(0, 120)}${getCurrentSearchKeywords().length > 120 ? '…' : ''}"`);
+    }
+  } else {
+    console.log('   🤝 Buscando recrutadores (intervalo da pausa)...');
+  }
   let totalConnected = 0;
-  const sendModalSel =
-    'button:has-text("Enviar sem nota"), button:has-text("Send without a note"), button:has-text("Send without note"), button:has-text("Enviar"), button:has-text("Send"), button[aria-label*="Enviar"], button[aria-label*="Send invitation"]';
 
   for (const term of terms) {
     if (totalConnected >= maxConn) break;
-    const searchUrl = `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(term)}`;
+    if (deadline != null && Date.now() >= deadline) break;
+
+    const searchUrl = buildLinkedInPeopleSearchUrl(term);
     try {
       await page.goto(searchUrl, { waitUntil: 'load', timeout: 50000 });
     } catch {
       await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 50000 });
     }
+    if (deadline != null && Date.now() >= deadline) break;
     await longDelay();
     await page
       .waitForSelector(
@@ -437,78 +618,85 @@ async function connectWithRecruiters(page) {
         { timeout: 20000 }
       )
       .catch(() => null);
+    await randomDelay(1500, 3200);
+    await tryApplyActivelyHiringPeopleFilter(page);
     await randomDelay(2000, 4500);
     await humanScroll(page, 'down', 400);
     await randomDelay(1500, 3000);
 
     const items = page.locator(
-      'li.reusable-search__result-container, li[data-chameleon-result-urn]'
+      'li.reusable-search__result-container, li[data-chameleon-result-urn], .reusable-search__entity-result-list .reusable-search__entity-result'
     );
     const nItems = await items.count().catch(() => 0);
-    const maxScan = Math.min(nItems, 28);
+    const maxScan = Math.min(nItems, 35);
 
     for (let i = 0; i < maxScan && totalConnected < maxConn; i++) {
+      if (deadline != null && Date.now() >= deadline) break;
+
       const item = items.nth(i);
       await item.scrollIntoViewIfNeeded().catch(() => null);
-      await randomDelay(400, 1100);
+      await randomDelay(450, 1200);
 
-      const pending = item.locator(
-        'button:has-text("Pendente"), button:has-text("Pending"), span:has-text("Pendente"), span:has-text("1º grau"), span:has-text("1st")'
-      );
-      if ((await pending.count().catch(() => 0)) > 0) continue;
+      if (cardMatchTokens.length > 0) {
+        const okCard = await searchResultCardMatchesJobInterest(item, cardMatchTokens);
+        if (!okCard) continue;
+      }
 
-      const connectBtn = item
-        .locator(
-          'button:has-text("Conectar"), button:has-text("Connect"), button[aria-label*="Conectar"], button[aria-label*="Connect"], button[aria-label*="Convidar"], button[aria-label*="Invite"]'
-        )
-        .first();
+      const clicked = await tryClickConnectInSearchResult(item, page);
+      if (!clicked) continue;
 
-      if ((await connectBtn.count().catch(() => 0)) === 0) continue;
-      const visible = await connectBtn.isVisible().catch(() => false);
-      if (!visible) continue;
-
-      await connectBtn.click({ timeout: 6000 }).catch(() => null);
-      await randomDelay(1200, 2200);
-
-      const sendBtn = page.locator(sendModalSel).first();
-      if ((await sendBtn.count().catch(() => 0)) > 0) {
-        await sendBtn.click({ timeout: 5000 }).catch(() => null);
+      const sendBtn = page.locator(SEND_INVITE_MODAL_SEL).first();
+      await randomDelay(600, 1400);
+      if ((await sendBtn.count().catch(() => 0)) > 0 && (await sendBtn.isVisible().catch(() => false))) {
+        await sendBtn.click({ timeout: 6000 }).catch(() => null);
         totalConnected++;
-        console.log(`   🤝 Conexão ${totalConnected}/${maxConn} enviada`);
+        if (!quiet) console.log(`   🤝 Conexão ${totalConnected}/${maxConn} enviada`);
+        else console.log(`   🤝 Conexão ${totalConnected}/${maxConn} (pausa)`);
       } else {
         await page.keyboard.press('Escape').catch(() => null);
       }
-      await randomDelay(2500, 5000);
+      await randomDelay(2200, 4800);
     }
 
-    if (totalConnected === 0 && (config.debugConnect ?? false)) {
+    if (totalConnected === 0 && (config.debugConnect ?? false) && !quiet) {
       await page.screenshot({ path: 'debug-connect.png' }).catch(() => null);
       console.log('   🐛 Screenshot: debug-connect.png (debugConnect: true)');
     }
   }
-  if (totalConnected > 0) console.log(`   ✅ ${totalConnected} conexões enviadas a recrutadores.`);
-  else
-    console.log(
-      '   ⚠️ Nenhuma conexão enviada (UI diferente, já conectados, ou limite de busca). Tente debugConnect: true e termos em português em recruiterSearchTerms.'
-    );
+  if (!quiet) {
+    if (totalConnected > 0) console.log(`   ✅ ${totalConnected} conexões enviadas a recrutadores.`);
+    else
+      console.log(
+        '   ⚠️ Nenhuma conexão enviada (UI diferente, já conectados, Premium/filtro “contratando agora”, ou limite). debugConnect: true; ajuste recruiterSearchTerms / recruiterSearchAlignWithJobKeywords.'
+      );
+  } else if (totalConnected > 0) {
+    console.log(`   ✅ ${totalConnected} conexão(ões) na pausa.`);
+  }
+  return totalConnected;
 }
 
 /** Garante que estamos na página de vagas (jobs) */
 async function ensureJobsPage(page) {
   const url = page.url();
   if (!url.includes('linkedin.com/jobs')) {
-    const params = new URLSearchParams({ keywords: config.searchKeywords, location: 'Brasil', f_AL: 'true' });
+    const params = new URLSearchParams({
+      keywords: getCurrentSearchKeywords(),
+      location: 'Brasil',
+      f_AL: 'true',
+    });
     await page.goto(`https://www.linkedin.com/jobs/search/?${params}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await longDelay();
   }
 }
 
 async function goToJobs(page) {
+  const kw = getCurrentSearchKeywords();
   console.log('📋 Navegando para vagas...');
+  console.log(`   🔎 Termo atual: ${kw || '(vazio)'}`);
 
   // URL direta com busca + Easy Apply - apenas vagas do Brasil
   const params = new URLSearchParams({
-    keywords: config.searchKeywords,
+    keywords: kw,
     location: 'Brasil',
     f_AL: 'true', // Candidatura simplificada
   });
@@ -526,6 +714,69 @@ async function searchJobs(page) {
     state: 'visible',
   }).catch(() => null);
   await longDelay();
+}
+
+/**
+ * Avança para a próxima página de resultados de vagas (botão de paginação ou parâmetro start= na URL).
+ */
+async function goToNextJobsResultsPage(page) {
+  const step = config.jobsResultsPageStep ?? 25;
+  const nextBtn = page
+    .locator(
+      'button.jobs-search-pagination__button--next, button[data-test-pagination-next], button[aria-label*="Next"], button[aria-label*="Próxima"], button[aria-label*="próxima"]'
+    )
+    .first();
+
+  try {
+    if ((await nextBtn.count()) > 0) {
+      const disabled = await nextBtn.getAttribute('disabled');
+      const ariaDis = await nextBtn.getAttribute('aria-disabled');
+      const cls = (await nextBtn.getAttribute('class')) || '';
+      if (!disabled && ariaDis !== 'true' && !cls.includes('disabled')) {
+        console.log('   📄 Próxima página de vagas (paginação)...');
+        await nextBtn.scrollIntoViewIfNeeded().catch(() => null);
+        await randomDelay(400, 900);
+        await nextBtn.click({ timeout: 10000 }).catch(() => null);
+        await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => null);
+        await longDelay();
+        await page
+          .waitForSelector('.job-card-container, .jobs-search-results__list-item, [data-job-id]', {
+            timeout: 12000,
+          })
+          .catch(() => null);
+        await randomDelay(1200, 2500);
+        const cards = await page.$$('.job-card-container, .jobs-search-results__list-item, [data-job-id]');
+        return cards.length > 0;
+      }
+    }
+  } catch {}
+
+  try {
+    const url = new URL(page.url());
+    if (!url.hostname.includes('linkedin.com') || !url.pathname.includes('/jobs/search')) return false;
+    const start = parseInt(url.searchParams.get('start') || '0', 10) + step;
+    url.searchParams.set('start', String(start));
+    if (!url.searchParams.has('keywords')) url.searchParams.set('keywords', getCurrentSearchKeywords() || '');
+    if (!url.searchParams.has('location')) url.searchParams.set('location', 'Brasil');
+    if (!url.searchParams.has('f_AL')) url.searchParams.set('f_AL', 'true');
+    console.log(`   📄 Próxima página de vagas (start=${start})...`);
+    await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 50000 }).catch(() => null);
+    await longDelay();
+    await page
+      .waitForSelector('.job-card-container, .jobs-search-results__list-item, [data-job-id]', {
+        timeout: 12000,
+      })
+      .catch(() => null);
+    await randomDelay(1200, 2500);
+    const cards = await page.$$('.job-card-container, .jobs-search-results__list-item, [data-job-id]');
+    if (cards.length === 0) {
+      console.log('   ⏭️ Sem vagas nesta página (fim da busca ou start inválido).');
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function getJobTitle(page) {
@@ -650,6 +901,7 @@ function readDailyApplyState() {
 }
 
 function incrementDailyApplyCount() {
+  if (!(config.maxApplicationsPerDay > 0)) return;
   const today = todayKeyForDailyLimit();
   let count = 0;
   try {
@@ -660,6 +912,199 @@ function incrementDailyApplyCount() {
   } catch {}
   count += 1;
   writeFileSync(DAILY_APPLY_STATE_FILE, JSON.stringify({ date: today, count }, null, 0), 'utf8');
+}
+
+function getSearchKeywordsList() {
+  if (Array.isArray(config.searchKeywordsList) && config.searchKeywordsList.length > 0) {
+    return config.searchKeywordsList.map((s) => String(s).trim()).filter(Boolean);
+  }
+  if (typeof config.searchKeywords === 'string' && config.searchKeywords.trim()) {
+    return [config.searchKeywords.trim()];
+  }
+  return [''];
+}
+
+/** Termo de busca atual na URL de vagas (respeita rotação). */
+function getCurrentSearchKeywords() {
+  const list = getSearchKeywordsList();
+  if (list.length === 0) return '';
+  return list[searchKeywordsRotationIndex % list.length];
+}
+
+function advanceSearchKeywordRotation() {
+  const list = getSearchKeywordsList();
+  if (list.length <= 1) return;
+  searchKeywordsRotationIndex = (searchKeywordsRotationIndex + 1) % list.length;
+}
+
+/** Tokens do termo de vagas para cruzar com o texto do card (opcional). */
+function tokenizeJobKeywordsForRecruiterMatch(raw) {
+  if (!raw || typeof raw !== 'string') return [];
+  const stop = new Set([
+    'the',
+    'and',
+    'or',
+    'for',
+    'with',
+    'from',
+    'com',
+    'para',
+    'uma',
+    'dos',
+    'das',
+    'por',
+    'que',
+    'remoto',
+    'remote',
+  ]);
+  const parts = raw.split(/\s+OR\s+|\s+or\s+|\||,/i).map((p) => p.trim()).filter(Boolean);
+  const tokens = new Set();
+  for (const part of parts) {
+    for (const w of part.split(/\s+/)) {
+      const t = w.replace(/^[^\p{L}\p{N}.+#]+|[^\p{L}\p{N}.+#]+$/gu, '').toLowerCase();
+      if (t.length >= 3 && !stop.has(t)) tokens.add(t);
+    }
+  }
+  return [...tokens].slice(0, 18);
+}
+
+/**
+ * Consultas para busca de pessoas: mescla interesse de vagas (termo atual) com recrutador/talent.
+ */
+function getRecruiterPeopleSearchQueries() {
+  const recTerms = (config.recruiterSearchTerms ?? ['tech recruiter', 'recrutador tech']).map((t) => String(t).trim()).filter(Boolean);
+  const align = config.recruiterSearchAlignWithJobKeywords !== false;
+  const jobKw = getCurrentSearchKeywords().trim();
+  if (!align || !jobKw) return recTerms;
+  return recTerms.map((t) => {
+    const j = jobKw.slice(0, 280);
+    if (t.toLowerCase().includes(j.slice(0, Math.min(24, j.length)).toLowerCase())) return t;
+    return `${j} ${t}`.trim();
+  });
+}
+
+function buildLinkedInPeopleSearchUrl(keywords) {
+  const params = new URLSearchParams();
+  params.set('keywords', keywords);
+  if (config.recruiterActivelyHiringFilter !== false) {
+    params.set('activelyHiring', 'true');
+  }
+  return `https://www.linkedin.com/search/results/people/?${params.toString()}`;
+}
+
+/** Liga o filtro "Contratando agora" / Actively hiring na busca de pessoas (UI; Premium pode ser exigido). */
+async function tryApplyActivelyHiringPeopleFilter(page) {
+  if (config.recruiterActivelyHiringFilter === false) return false;
+  try {
+    await page.evaluate(() => window.scrollTo(0, 0));
+  } catch {}
+  await randomDelay(400, 900);
+
+  const namePatterns = [
+    /actively\s*hiring/i,
+    /contratando\s*agora/i,
+    /estão\s*contratando/i,
+    /estao\s*contratando/i,
+    /open\s*to\s*hiring/i,
+    /recrutando\s*agora/i,
+  ];
+  for (const re of namePatterns) {
+    const btn = page.getByRole('button', { name: re }).first();
+    if ((await btn.count().catch(() => 0)) === 0) continue;
+    const vis = await btn.isVisible().catch(() => false);
+    if (!vis) continue;
+    const pressed = await btn.getAttribute('aria-pressed').catch(() => null);
+    if (pressed === 'true') return true;
+    await btn.click({ timeout: 6000 }).catch(() => null);
+    await randomDelay(2200, 4200);
+    return true;
+  }
+
+  const pill = page
+    .locator(
+      'button.artdeco-pill, button[class*="filter-pill"], button.search-reusables__filter-pill-button, .search-reusables__filter-pill button'
+    )
+    .filter({ hasText: /Actively hiring|Contratando agora|Estão contratando|Open to hiring|Recrutando agora/i })
+    .first();
+  if ((await pill.count().catch(() => 0)) > 0 && (await pill.isVisible().catch(() => false))) {
+    const pressed = await pill.getAttribute('aria-pressed').catch(() => null);
+    if (pressed !== 'true') await pill.click({ timeout: 6000 }).catch(() => null);
+    await randomDelay(2200, 4200);
+    return true;
+  }
+
+  const allFilters = page
+    .locator('button:has-text("All filters"), button:has-text("Todos os filtros")')
+    .first();
+  if ((await allFilters.count().catch(() => 0)) > 0 && (await allFilters.isVisible().catch(() => false))) {
+    await allFilters.click({ timeout: 5000 }).catch(() => null);
+    await randomDelay(800, 1600);
+    const row = page
+      .locator('label, fieldset, div')
+      .filter({ hasText: /Actively hiring|Contratando agora|Estão contratando|Open to hiring/i })
+      .first();
+    if ((await row.count().catch(() => 0)) > 0) {
+      const cb = row.locator('input[type="checkbox"]').first();
+      if ((await cb.count().catch(() => 0)) > 0) await cb.click({ timeout: 4000 }).catch(() => null);
+      else await row.click({ timeout: 3000 }).catch(() => null);
+      await randomDelay(400, 800);
+    }
+    const showResults = page.locator('button:has-text("Show results"), button:has-text("Mostrar resultados")').first();
+    if ((await showResults.count().catch(() => 0)) > 0) {
+      await showResults.click({ timeout: 5000 }).catch(() => null);
+      await randomDelay(2000, 4000);
+    } else {
+      await page.keyboard.press('Escape').catch(() => null);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+async function searchResultCardMatchesJobInterest(item, tokens) {
+  if (!tokens.length) return true;
+  const text = (await item.innerText().catch(() => '')).toLowerCase();
+  return tokens.some((t) => text.includes(t));
+}
+
+/** Após um lote de candidaturas: ficar no feed rolando por um tempo aleatório. */
+async function browseFeedAfterJobBatch(page) {
+  const min = config.feedBreakAfterBatchMinMs ?? 180_000;
+  const max = config.feedBreakAfterBatchMaxMs ?? Math.max(min, 480_000);
+  const lo = Math.min(min, max);
+  const hi = Math.max(min, max);
+  const duration = lo + Math.floor(Math.random() * (hi - lo + 1));
+  console.log(`📱 Pausa no feed ~${Math.round(duration / 60000)} min (duração alternada)...`);
+  await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 35000 });
+  await longDelay();
+  const end = Date.now() + duration;
+  let liked = 0;
+  const maxLikes = config.feedBreakMaxLikes ?? 12;
+  while (Date.now() < end && !stopRequested) {
+    const likeBtns = await page.$$('button[aria-label*="Curtir"], button[aria-label*="Like"], button[aria-label*="Reagir"]');
+    for (const btn of likeBtns) {
+      if (liked >= maxLikes || Date.now() >= end) break;
+      try {
+        const pressed = await btn.getAttribute('aria-pressed');
+        if (pressed === 'true') continue;
+        const parent = await btn.evaluate(
+          (el) => el.closest('.feed-shared-update-v2, [data-urn]')?.textContent || ''
+        );
+        if (hasPoliticsContent(parent)) continue;
+        if (Math.random() < 0.4) continue;
+        await btn.scrollIntoViewIfNeeded();
+        await shortDelay();
+        await btn.click();
+        liked++;
+        console.log(`   👍 Feed (lote): curtida ${liked}`);
+        await randomDelay(2500, 5000);
+      } catch {}
+    }
+    await humanScroll(page, 'down', 360 + Math.random() * 220);
+    await randomDelay(2000, 6000);
+  }
+  console.log(`   ✅ Feed: fim da pausa (${liked} curtidas).`);
 }
 
 /**
@@ -693,16 +1138,76 @@ async function pauseMsWithStopCheck(ms, label) {
   }
 }
 
-async function pauseAfterApply() {
+/** Volta à lista de vagas após navegar para pessoas/feed durante uma pausa. */
+async function restoreJobsSearchList(page) {
+  const u = page.url();
+  try {
+    const parsed = new URL(u);
+    if (parsed.pathname.includes('/jobs/search')) {
+      await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => null);
+      await longDelay();
+      return;
+    }
+  } catch {}
+  const params = new URLSearchParams({
+    keywords: getCurrentSearchKeywords(),
+    location: 'Brasil',
+    f_AL: 'true',
+  });
+  await page.goto(`https://www.linkedin.com/jobs/search/?${params}`, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => null);
+  await longDelay();
+}
+
+async function pauseAfterApply(page, doConnectGlobal) {
   const min = config.afterApplyDelayMinMs ?? 60_000;
   const max = config.afterApplyDelayMaxMs ?? Math.max(min, 180_000);
   const lo = Math.min(min, max);
   const hi = Math.max(min, max);
   const ms = lo + Math.floor(Math.random() * (hi - lo + 1));
-  await pauseMsWithStopCheck(
-    ms,
-    `   ☕ Pausa pós-candidatura ~${Math.round(ms / 60000)} min (varia por execução)...`
+  const deadline = Date.now() + ms;
+  const useRecruiters =
+    (config.recruitersDuringApplyPause !== false) &&
+    (doConnectGlobal !== false) &&
+    (config.maxConnectionsToRecruiters ?? 10) > 0;
+
+  console.log(
+    `   ☕ Pausa pós-candidatura ~${Math.round(ms / 60000)} min${useRecruiters ? ' — incluindo conexões com recrutadores.' : ''}`
   );
+
+  if (!useRecruiters || !page) {
+    await pauseMsWithStopCheck(ms, null);
+    return;
+  }
+
+  const jobsListUrl =
+    page.url().includes('linkedin.com/jobs/search') ? page.url() : null;
+
+  const perRound = Math.max(1, config.pauseAfterApplyRecruiterConnections ?? 4);
+  while (Date.now() < deadline && !stopRequested) {
+    const left = deadline - Date.now();
+    if (left < 25_000) {
+      await pauseMsWithStopCheck(left, null);
+      break;
+    }
+    await connectWithRecruiters(page, {
+      maxConn: perRound,
+      quiet: true,
+      deadline,
+    });
+    const after = deadline - Date.now();
+    if (after <= 0) break;
+    const idle = Math.min(after, 20_000 + Math.floor(Math.random() * 55_000));
+    await pauseMsWithStopCheck(idle, null);
+  }
+
+  if (jobsListUrl) {
+    await page.goto(jobsListUrl, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => restoreJobsSearchList(page));
+  } else {
+    await restoreJobsSearchList(page);
+  }
+  await page
+    .waitForSelector('.job-card-container, .jobs-search-results__list-item, [data-job-id]', { timeout: 12000 })
+    .catch(() => null);
 }
 
 async function pauseAfterBrowseOnly() {
@@ -947,6 +1452,278 @@ async function fillFormFields(page, jobTitle) {
       }
     } catch {}
   }
+
+  // 6. Checkboxes (aceito termos, li e concordo, etc.)
+  const checkboxes = await modalScope.locator('input[type="checkbox"]').all();
+  for (const box of checkboxes) {
+    try {
+      const checked = await box.isChecked().catch(() => true);
+      if (checked) continue;
+      const ctx =
+        (await box
+          .evaluate((el) => {
+            const l = el.closest('label')?.textContent || '';
+            const p = el.closest('div')?.textContent || '';
+            return (l + p).toLowerCase();
+          })
+          .catch(() => '')) || '';
+      if (
+        /aceito|concordo|autorizo|li e|i agree|i have read|termos|privacy|política|confirmo/i.test(ctx)
+      ) {
+        await box.click({ force: true }).catch(() => null);
+        await shortDelay();
+      }
+    } catch {}
+  }
+
+  // 7. Textareas (carta, motivação, comentário adicional)
+  const defaultNote =
+    config.easyApplyDefaultMessage ||
+    'Tenho interesse na vaga e experiência alinhada ao que foi descrito.';
+  const textareaHints =
+    /carta|apresentação|cover|mensagem|motivo|why|additional|comentário|descreva|explain|tell us|por que|porque/i;
+  const textareas = await modalScope.locator('textarea').all();
+  for (const ta of textareas) {
+    try {
+      const ctx = await ta
+        .evaluate((el) => {
+          const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+          const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+          const p = el.closest('div')?.textContent || '';
+          return ph + aria + p.toLowerCase();
+        })
+        .catch(() => '');
+      const val = await ta.inputValue().catch(() => '');
+      if (!val && textareaHints.test(ctx)) {
+        await ta.fill(defaultNote);
+        await shortDelay();
+      }
+    } catch {}
+  }
+
+  // 8. Demais textareas vazias (perguntas abertas do empregador)
+  if (config.easyApplyFillAllEmptyTextareas !== false) {
+    const tas2 = await modalScope.locator('textarea').all();
+    for (const ta of tas2) {
+      try {
+        const v = await ta.inputValue().catch(() => '');
+        if (!v) {
+          await ta.fill(defaultNote);
+          await shortDelay();
+        }
+      } catch {}
+    }
+  }
+
+  // 9. Radiogroup sem escolha → Sim/Yes ou primeira opção que não seja “upload”
+  const radiogroups = await modalScope.locator('[role="radiogroup"], fieldset').all();
+  for (const rg of radiogroups) {
+    try {
+      const checked = await rg.locator('input[type="radio"]:checked').count();
+      if (checked > 0) continue;
+      const simLbl = rg.locator('label:has-text("Sim"), label:has-text("Yes"), label:has-text("Sí")').first();
+      if ((await simLbl.count()) > 0) {
+        await simLbl.click({ force: true }).catch(() => null);
+        await shortDelay();
+        continue;
+      }
+      const first = rg.locator('input[type="radio"]').first();
+      if ((await first.count()) > 0) {
+        const lt = await first.evaluate((el) => (el.closest('label')?.innerText || '').toLowerCase()).catch(() => '');
+        if (!/upload|carregar|choose file|enviar arquivo/i.test(lt)) {
+          await first.click({ force: true }).catch(() => null);
+          await shortDelay();
+        }
+      }
+    } catch {}
+  }
+
+  // 10. Blocos de formulário do LinkedIn (.fb-form-element) sem rádio marcado
+  const fbBlocks = await modalScope.locator('.fb-form-element, .jobs-easy-apply-form-element').all();
+  for (const block of fbBlocks) {
+    try {
+      if ((await block.locator('input[type="radio"]:checked').count()) > 0) continue;
+      const y = block.locator('label:has-text("Sim"), label:has-text("Yes")').first();
+      if ((await y.count()) > 0) {
+        await y.click({ force: true }).catch(() => null);
+        await shortDelay();
+      }
+    } catch {}
+  }
+
+  // 11. Select ainda em “Selecionar…” → Brasil ou primeira opção válida
+  for (const sel of selects) {
+    try {
+      const cur = ((await sel.locator('option:checked').first().textContent().catch(() => '')) || '').trim().toLowerCase();
+      if (cur && !cur.includes('selecionar') && !cur.includes('select an') && cur !== '') {
+        continue;
+      }
+      const opts = await sel.locator('option').all();
+      let done = false;
+      for (const opt of opts) {
+        const t = ((await opt.textContent()) || '').trim();
+        const tl = t.toLowerCase();
+        if (!t || tl.includes('selecionar') || tl.includes('select an')) continue;
+        if (/brasil|brazil/.test(tl)) {
+          const v = await opt.getAttribute('value');
+          if (v !== null && v !== '') await sel.selectOption({ value: v }).catch(() => {});
+          else await sel.selectOption({ label: t }).catch(() => {});
+          done = true;
+          break;
+        }
+      }
+      if (!done) {
+        for (const opt of opts) {
+          const t = ((await opt.textContent()) || '').trim();
+          const tl = t.toLowerCase();
+          if (!t || tl.includes('selecionar') || tl.includes('select an')) continue;
+          const v = await opt.getAttribute('value');
+          if (v !== null && v !== '') await sel.selectOption({ value: v }).catch(() => {});
+          else await sel.selectOption({ label: t }).catch(() => {});
+          break;
+        }
+      }
+      await shortDelay();
+    } catch {}
+  }
+
+  // 12. Dropdowns artdeco (lista suspensa customizada)
+  const ddTriggers = await modalScope
+    .locator('button.artdeco-dropdown__trigger, .jobs-easy-apply-form-element__dropdown-button')
+    .all();
+  for (const btn of ddTriggers) {
+    try {
+      if (!(await btn.isVisible().catch(() => false))) continue;
+      const tx = ((await btn.textContent()) || '').toLowerCase();
+      if (!/selecionar|select an option|select option/i.test(tx)) continue;
+      await btn.click({ force: true }).catch(() => null);
+      await shortDelay();
+      const simOpt = page
+        .locator('[role="listbox"] [role="option"], .artdeco-dropdown__item, li[role="option"]')
+        .filter({ hasText: /^(Sim|Yes|Sí)$/i })
+        .first();
+      if ((await simOpt.count()) > 0 && (await simOpt.isVisible().catch(() => false))) {
+        await simOpt.click({ force: true }).catch(() => null);
+      } else {
+        const firstOpt = page.locator('[role="listbox"] [role="option"], .artdeco-dropdown__item').first();
+        if ((await firstOpt.count()) > 0) await firstOpt.click({ force: true }).catch(() => null);
+      }
+      await shortDelay();
+      await page.keyboard.press('Escape').catch(() => null);
+    } catch {}
+  }
+
+  // 13. Inputs texto/número vazios (anos de experiência, URL, etc.)
+  const genInputs = await modalScope.locator('input[type="text"], input[type="number"]').all();
+  for (const input of genInputs) {
+    try {
+      const val = await input.inputValue().catch(() => '');
+      if (val) continue;
+      const ctx = await input
+        .evaluate((el) => {
+          const id = el.id;
+          let lb = '';
+          try {
+            if (id) lb = document.querySelector(`label[for="${CSS.escape(id)}"]`)?.textContent || '';
+          } catch {}
+          const p = el.closest('.jobs-easy-apply-form-element')?.textContent || el.closest('div')?.textContent || '';
+          return ((lb || '') + ' ' + p).toLowerCase();
+        })
+        .catch(() => '');
+      if (/ano|year|experiência|experience|how many|quantos anos/i.test(ctx)) {
+        await input.fill(String(experience)).catch(() => null);
+        await shortDelay();
+      } else if (/(linkedin|github|portfolio|website|url|site)/i.test(ctx) && config.portfolioUrl) {
+        await input.fill(String(config.portfolioUrl)).catch(() => null);
+        await shortDelay();
+      }
+    } catch {}
+  }
+}
+
+/**
+ * Tenta usar currículo já salvo no LinkedIn (perfil / candidatura recente) — nunca aciona upload novo.
+ */
+async function tryUseLinkedInSavedResume(page) {
+  if (config.preferLinkedInSavedResume === false) return false;
+  const modal = page.locator('[data-test-modal-id="easy-apply-modal"], .jobs-easy-apply-content').first();
+  let tried = false;
+
+  const clickIfVisible = async (loc) => {
+    if ((await loc.count()) === 0) return false;
+    const vis = await loc.first().isVisible().catch(() => false);
+    if (!vis) return false;
+    await loc.first().click({ timeout: 4000, force: true }).catch(() => null);
+    await shortDelay();
+    return true;
+  };
+
+  const textPatterns = [
+    modal.locator('label').filter({ hasText: /usar o currículo mais recente|use most recent resume/i }),
+    modal.locator('label').filter({ hasText: /currículo salvo|saved resume|resume on file/i }),
+    modal.locator('label').filter({ hasText: /do seu perfil|from your profile|perfil do linkedin/i }),
+    modal.locator('span, button, div').filter({ hasText: /usar este currículo|use this resume/i }),
+    modal.locator('label, span, div').filter({ hasText: /compartilhar perfil|share profile|online resume/i }),
+    modal.locator('label, span').filter({ hasText: /currículo do linkedin|linkedin resume/i }),
+    modal.locator('button, a').filter({ hasText: /aplicar com o perfil|apply using profile/i }),
+  ];
+  for (const loc of textPatterns) {
+    if (await clickIfVisible(loc)) {
+      tried = true;
+      break;
+    }
+  }
+
+  // Não clicar no nome do .pdf (pode abrir preview ou disparar download). Só rádios / rótulos abaixo.
+
+  if (!tried) {
+    const radios = await modal.locator('input[type="radio"], [role="radio"]').all();
+    for (const r of radios) {
+      try {
+        const blob =
+          `${(await r.getAttribute('aria-label')) || ''} ${(await r.textContent()) || ''} ${await r.evaluate((el) => el.closest('label')?.innerText || el.parentElement?.innerText || '')}`.toLowerCase();
+        if (/upload|carregar|enviar arquivo|choose file|selecionar arquivo|novo currículo|new resume|upload a file|attach/i.test(blob)) {
+          continue;
+        }
+        if (/pdf|doc|currículo|resume|recent|salvo|saved|perfil|profile|última|last application|candidatura|online|linkedin/i.test(blob)) {
+          await r.click({ force: true, timeout: 3000 }).catch(() => null);
+          await shortDelay();
+          tried = true;
+          break;
+        }
+      } catch {}
+    }
+  }
+
+  if (tried) {
+    console.log('   📎 Usando currículo / perfil já no LinkedIn (sem enviar arquivo novo).');
+  }
+  return tried;
+}
+
+/** Fecha o modal Easy Apply (várias estratégias — evita ficar preso em campo não mapeado). */
+async function dismissEasyApplyModal(page) {
+  const modalScope = page.locator('[data-test-modal-id="easy-apply-modal"], .jobs-easy-apply-content').first();
+  const selectors = [
+    'button[aria-label="Dismiss"]',
+    'button[aria-label="Fechar"]',
+    'button[aria-label="Close"]',
+    '[data-test-modal-close-btn]',
+    'button.artdeco-modal__dismiss',
+    '.artdeco-modal__dismiss',
+  ];
+  for (const sel of selectors) {
+    try {
+      const btn = modalScope.locator(sel).first();
+      if ((await btn.count()) > 0) {
+        await btn.click({ timeout: 2500, force: true }).catch(() => null);
+        await shortDelay();
+        return;
+      }
+    } catch {}
+  }
+  await page.keyboard.press('Escape').catch(() => null);
+  await shortDelay();
 }
 
 async function applyToJob(page) {
@@ -997,6 +1774,8 @@ async function applyToJob(page) {
     });
     if (!modalOk) return false;
 
+    await tryUseLinkedInSavedResume(page);
+
     // LinkedIn limite diário? Para e vai para feed/recrutadores
     if (await isDailyLimitReached(page)) {
       console.log('   ⚠️ Limite diário do LinkedIn atingido. Parando candidaturas.');
@@ -1009,13 +1788,34 @@ async function applyToJob(page) {
     // Fluxo do modal Easy Apply - clica APENAS em botões DENTRO do modal
     let applied = false;
     let attempts = 0;
-    const maxAttempts = 15;
+    const maxAttempts = config.easyApplyMaxModalSteps ?? 24;
 
     while (!applied && attempts < maxAttempts) {
+      const modalRoot = page.locator('[data-test-modal-id="easy-apply-modal"], .jobs-easy-apply-content').first();
+
+      // Só pula por arquivo se você marcou skipEasyApplyWithFileUpload: true (forçado).
+      // Por padrão tenta usar currículo do perfil (tryUseLinkedInSavedResume em fillFormFields).
+      if (config.skipEasyApplyWithFileUpload === true) {
+        const fileCount = await modalRoot.locator('input[type="file"]').count().catch(() => 0);
+        if (fileCount > 0) {
+          console.log('   ⚠️ skipEasyApplyWithFileUpload: true — fechando vaga com campo de arquivo.');
+          await dismissEasyApplyModal(page);
+          return false;
+        }
+      }
+
+      if (attempts >= (config.easyApplyStuckDismissAfter ?? 16)) {
+        console.log('   ⚠️ Muitas etapas no Easy Apply — fechando para não travar.');
+        await dismissEasyApplyModal(page);
+        return false;
+      }
+
       await runStep(`APPLY_MODAL_STEP_${attempts + 1}`, async () => {
+        await tryUseLinkedInSavedResume(page);
         await fillFormFields(page, jobTitle);
         await shortDelay();
         await scrollModalToBottom(page);
+        await tryUseLinkedInSavedResume(page);
       });
 
       const modalScope = page.locator('[data-test-modal-id="easy-apply-modal"]').first();
@@ -1027,24 +1827,52 @@ async function applyToJob(page) {
         return 'daily_limit';
       }
 
-      // Botão "Enviar candidatura" (último passo) - dentro do modal
-      const submitLoc = modalScope.locator('button:has-text("Enviar candidatura"), button:has-text("Submit application"), button:has-text("Enviar")').first();
-      if (await submitLoc.count() > 0) {
-        await runStep('APPLY_CLICK_ENVIAR', async () => {
-          await submitLoc.scrollIntoViewIfNeeded().catch(() => null);
-          await submitLoc.waitFor({ state: 'visible', timeout: 3000 }).catch(() => null);
-          await submitLoc.click({ timeout: 8000, force: true });
-        });
-        await randomDelay(2000, 4000);
-        applied = true;
-        // Aguarda modal de sucesso "Candidatura enviada" aparecer
-        await page.waitForSelector('button:has-text("Concluído"), button:has-text("Done")', { timeout: 5000 }).catch(() => null);
-        break;
+      // Botão enviar / aplicar (várias variações de texto)
+      const submitLoc = modalScope
+        .locator(
+          'button:has-text("Enviar candidatura"), button:has-text("Submit application"), button:has-text("Submit"), button:has-text("Enviar inscrição"), button:has-text("Aplicar agora"), button:has-text("Apply now"), button:has-text("Aplicar")'
+        )
+        .first();
+      if ((await submitLoc.count()) > 0) {
+        const subEnabled = await submitLoc.isEnabled().catch(() => true);
+        if (subEnabled) {
+          await runStep('APPLY_CLICK_ENVIAR', async () => {
+            await submitLoc.scrollIntoViewIfNeeded().catch(() => null);
+            await submitLoc.waitFor({ state: 'visible', timeout: 3000 }).catch(() => null);
+            await submitLoc.click({ timeout: 8000, force: true });
+          });
+          await randomDelay(2000, 4000);
+          applied = true;
+          await page.waitForSelector('button:has-text("Concluído"), button:has-text("Done")', { timeout: 5000 }).catch(() => null);
+          break;
+        }
       }
 
-      // Botão "Avançar" (próximo passo) - dentro do modal
-      const nextLoc = modalScope.locator('button:has-text("Avançar"), button:has-text("Next"), button:has-text("Revisar")').first();
-      if (await nextLoc.count() > 0) {
+      const nextLoc = modalScope
+        .locator(
+          'button:has-text("Avançar"), button:has-text("Next"), button:has-text("Continue"), button:has-text("Continuar"), button:has-text("Revisar"), button:has-text("Review")'
+        )
+        .first();
+      if ((await nextLoc.count()) > 0) {
+        const dis = await nextLoc.getAttribute('disabled');
+        const ariaD = await nextLoc.getAttribute('aria-disabled');
+        let enabled = await nextLoc.isEnabled().catch(() => true);
+        if (dis || ariaD === 'true' || !enabled) {
+          console.log('   ⏳ Avançar desabilitado — reforçando currículo salvo e campos...');
+          await tryUseLinkedInSavedResume(page);
+          await fillFormFields(page, jobTitle);
+          await scrollModalToBottom(page);
+          await tryUseLinkedInSavedResume(page);
+          await randomDelay(600, 1400);
+          enabled = await nextLoc.isEnabled().catch(() => false);
+          const dis2 = await nextLoc.getAttribute('disabled');
+          const aria2 = await nextLoc.getAttribute('aria-disabled');
+          if (dis2 || aria2 === 'true' || !enabled) {
+            console.log('   ⚠️ Ainda não foi possível avançar — fechando esta candidatura.');
+            await dismissEasyApplyModal(page);
+            return false;
+          }
+        }
         await runStep('APPLY_CLICK_AVANCAR', async () => {
           await nextLoc.scrollIntoViewIfNeeded().catch(() => null);
           await nextLoc.waitFor({ state: 'visible', timeout: 3000 }).catch(() => null);
@@ -1053,9 +1881,8 @@ async function applyToJob(page) {
         });
         await readingDelay();
       } else {
-        // Sem Avançar nem Enviar - fecha e pula
-        const closeLoc = modalScope.locator('button[aria-label="Dismiss"], button[aria-label="Fechar"], button[aria-label="Close"]').first();
-        if (await closeLoc.count() > 0) await closeLoc.click({ timeout: 3000, force: true }).catch(() => null);
+        console.log('   ⚠️ Sem Avançar/Enviar reconhecido no modal — fechando.');
+        await dismissEasyApplyModal(page);
         break;
       }
       attempts++;
@@ -1112,6 +1939,10 @@ async function run() {
   console.log(
     `   Filtro de vaga: ${config.jobKeywordMatchMode === 'or' ? 'backend OU stack' : 'backend E stack'}${config.mergeDefaultJobKeywords === false ? ' (só suas keywords)' : ' + termos padrão'}`
   );
+  const kwList = getSearchKeywordsList();
+  if (kwList.length > 1) {
+    console.log(`   Rotação de busca: ${kwList.length} termos — após ${config.applicationsBeforeSearchRotate ?? 15} candidaturas → feed + recrutadores + próximo termo.`);
+  }
   console.log(`   Log de travamento: apenas durante candidatura (timeout ${STEP_TIMEOUT / 1000}s)`);
   if (config.headless) {
     console.log('👻 headless: true — o navegador roda sem janela. Para ver o Chrome: headless: false no config.js');
@@ -1222,6 +2053,7 @@ async function run() {
       } else throw new Error('Falha ao iniciar Firefox');
     }
     context = await browser.newContext({
+      acceptDownloads: false,
       viewport: VIEWPORT,
       userAgent: useFirefox
         ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
@@ -1235,6 +2067,8 @@ async function run() {
       permissions: ['geolocation'],
     });
   }
+
+  attachBlockAllDownloads(context);
 
   // Esconde que é automação
   await context.addInitScript(() => {
@@ -1254,6 +2088,7 @@ async function run() {
     await waitForManualLogin(page);
     if (loopMode) console.log('🔄 Modo loop ativo — Ctrl+C para parar');
     let cycleCount = 0;
+    let sessionApplyBatchCount = 0;
 
     const doApply = config.doApply ?? true;
     const doFeed = config.doFeed ?? config.doFeedAndRecruiters ?? true;
@@ -1281,6 +2116,8 @@ async function run() {
     let scrollRound = 0;
     let noNewCardsCount = 0;
     let dailyLimitReached = false;
+    let jobsPageIndex = 0;
+    const maxJobsPages = config.maxJobsSearchPages ?? 30;
 
     const filtros = (config.seniorOnly ? 'senior + ' : '') + 'backend + Node/Nest/TS/JS';
     const limiteCiclo = Number.isFinite(maxToApply) ? String(maxToApply) : '∞';
@@ -1366,7 +2203,36 @@ async function run() {
           const lim =
             Number.isFinite(maxToApply) && maxToApply > 0 ? `/${maxToApply}` : '';
           console.log(`   ✅ Candidatura ${applicationsCount}${lim} enviada!`);
-          await pauseAfterApply();
+          await pauseAfterApply(page, doConnect);
+
+          const batchN = config.applicationsBeforeSearchRotate ?? 15;
+          if (batchN > 0) {
+            sessionApplyBatchCount++;
+            if (sessionApplyBatchCount >= batchN) {
+              sessionApplyBatchCount = 0;
+              advanceSearchKeywordRotation();
+              console.log('');
+              console.log('═'.repeat(42));
+              console.log(`🔀 Lote de ${batchN} candidaturas: feed + recrutadores + nova busca`);
+              console.log(`   Próximo termo: "${getCurrentSearchKeywords()}"`);
+              console.log('═'.repeat(42));
+              await browseFeedAfterJobBatch(page);
+              if (doConnect) {
+                await connectWithRecruiters(page, {
+                  maxConn: config.afterBatchRecruiterConnections ?? config.maxConnectionsToRecruiters ?? 10,
+                  quiet: false,
+                });
+              }
+              await goToJobs(page);
+              await ensureJobsPage(page);
+              await searchJobs(page);
+              await humanScroll(page, 'down', 400);
+              await randomDelay(2000, 4000);
+              jobsPageIndex = 0;
+              noNewCardsCount = 0;
+              scrollRound = 0;
+            }
+          }
         } else {
           await randomDelay(2000, 5000);
         }
@@ -1375,7 +2241,19 @@ async function run() {
       if (stopRequested || dailyLimitReached || (hasLimit && applicationsCount >= maxToApply)) break;
       if (!hadNewCard) {
         noNewCardsCount = (noNewCardsCount || 0) + 1;
-        if (noNewCardsCount >= 3) break; // 3 rodadas sem vagas novas = acabou
+        if (noNewCardsCount >= 3) {
+          if (jobsPageIndex < maxJobsPages) {
+            const advanced = await goToNextJobsResultsPage(page);
+            if (advanced) {
+              jobsPageIndex++;
+              noNewCardsCount = 0;
+              await humanScroll(page, 'up', 120);
+              await randomDelay(800, 1600);
+              continue;
+            }
+          }
+          break;
+        }
       } else {
         noNewCardsCount = 0;
       }
@@ -1386,7 +2264,11 @@ async function run() {
       await randomDelay(2000, 4000);
       // Reaplica filtro Easy Apply se foi removido acidentalmente
       if (!page.url().includes('f_AL=true')) {
-        const params = new URLSearchParams({ keywords: config.searchKeywords, location: 'Brasil', f_AL: 'true' });
+        const params = new URLSearchParams({
+          keywords: getCurrentSearchKeywords(),
+          location: 'Brasil',
+          f_AL: 'true',
+        });
         await page.goto(`https://www.linkedin.com/jobs/search/?${params}`, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => null);
         await randomDelay(2000, 3000);
       }
